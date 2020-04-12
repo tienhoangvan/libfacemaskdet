@@ -6,8 +6,10 @@ import torch.backends.cudnn as cudnn
 import pickle
 import argparse
 import numpy as np
-
+import matplotlib.pyplot as plt
 sys.path.append(os.getcwd() + '/../../src')
+from config import cfg
+from evaluator import Evaluator
 from prior_box import PriorBox
 from timer import Timer
 from detection import Detect
@@ -17,7 +19,7 @@ from yufacedetectnet import YuFaceDetectNet
 parser = argparse.ArgumentParser(description='Face and Mask Detection')
 parser.add_argument('-m', '--trained_model', default='weights/yunet_final.pth', type=str, help='Trained state_dict file path to open')
 parser.add_argument('--data_dir', default='../../data/val', type=str, help='the image file to be detected')
-parser.add_argument('--conf_thresh', default=0.5, type=float, help='conf_thresh')
+parser.add_argument('--conf_thresh', default=0.6, type=float, help='conf_thresh')
 parser.add_argument('--top_k', default=100, type=int, help='top_k')
 parser.add_argument('--nms_thresh', default=0.5, type=float, help='nms_thresh')
 parser.add_argument('--device', default='cuda:0', help='which device the program will run on. cuda:0, cuda:1, ...')
@@ -57,41 +59,79 @@ def load_model(model, pretrained_path, load_to_cpu):
     model.load_state_dict(pretrained_dict, strict=False)
     return model
 
-def bbox_iou(box1, box2):
-    mx = min(box1[0], box2[0])
-    Mx = max(box1[2], box2[2])
-    my = min(box1[1], box2[1])
-    My = max(box1[3], box2[3])
-    w1 = box1[2] - box1[0]
-    h1 = box1[3] - box1[1]
-    w2 = box2[2] - box2[0]
-    h2 = box2[3] - box2[1]
-    uw = Mx - mx
-    uh = My - my
-    cw = w1 + w2 - uw
-    ch = h1 + h2 - uh
-    carea = 0
-    if cw <= 0 or ch <= 0:
-        return 0.0
-    area1 = w1 * h1
-    area2 = w2 * h2
-    carea = cw * ch
-    uarea = area1 + area2 - carea
-    return carea/uarea
+def plot_save_result(cfg, results, classes, savePath):
+    
+    
+    plt.rcParams['savefig.dpi'] = 80
+    plt.rcParams['figure.dpi'] = 130
 
-def evaluate_net(save_folder, net, dataset, detect):
+    acc_AP = 0
+    validClasses = 0
+    fig_index = 0
+
+    for cls_index, result in enumerate(results):
+        if result is None:
+            raise IOError('Error: Class %d could not be found.' % classId)
+
+        cls = result['class']
+        precision = result['precision']
+        recall = result['recall']
+        average_precision = result['AP']
+        acc_AP = acc_AP + average_precision
+        mpre = result['interpolated precision']
+        mrec = result['interpolated recall']
+        npos = result['total positives']
+        total_tp = result['total TP']
+        total_fp = result['total FP']
+
+        fig_index+=1
+        plt.figure(fig_index)
+        plt.plot(recall, precision, cfg['colors'][cls_index], label='Precision')
+        plt.xlabel('recall')
+        plt.ylabel('precision')
+        ap_str = "{0:.2f}%".format(average_precision * 100)
+        plt.title('Precision x Recall curve \nClass: %s, AP: %s' % (str(cls), ap_str))
+        plt.legend(shadow=True)
+        plt.grid()
+        plt.savefig(os.path.join(savePath, cls + '.png'))
+        plt.show()
+        plt.pause(0.05)
+
+
+    mAP = acc_AP / fig_index
+    mAP_str = "{0:.2f}%".format(mAP * 100)
+    print('mAP: %s' % mAP_str)
+
+def evaluate_net(net, dataset, detect):
     num_images = len(dataset)
     # print("num_images: %d" %(num_images))
+    classes = []
+    num_cls_gt = {}
     gt_dict = {}
-    est_dict = {}
+    det_dict = {}
 
     # timers
     _t = {'im_detect': Timer(), 'misc': Timer()}
     for i in range(num_images):
-        im, gt, h, w = dataset.pull_item(i)
+        im, gts, h, w = dataset.pull_item(i)
         img = im.unsqueeze(0)
         img = img.to(device)
         # print("image w: %d, h: %d" %(w, h))
+
+        # ground truth
+        idxOfImage = i
+        for gt in gts:
+            gcls = labels[np.int(gt[-1])]
+            gbox = gt[:4].tolist()
+            if gcls not in classes:
+                classes.append(gcls)
+                gt_dict[gcls] = {}
+                num_cls_gt[gcls] = 0             
+            num_cls_gt[gcls] += 1
+            gbox.append(0)
+            if idxOfImage not in gt_dict[gcls]:
+                gt_dict[gcls][idxOfImage] = []
+            gt_dict[gcls][idxOfImage].append(gbox)
 
         _t['im_detect'].tic()
         loc, conf = net(img)
@@ -104,61 +144,23 @@ def evaluate_net(save_folder, net, dataset, detect):
         detections = detect(loc, conf, priors)
         scale = torch.Tensor([w, h, w, h])
         # skip l = 0, because it's the background class
-        eval_det = np.empty((0, 5))
         for k in range(1, detections.size(1)):
             l = 0
             while detections[0,k,l,0] >= args.conf_thresh:
                 score = detections[0,k,l,0].cpu().numpy()
                 bndbox = (detections[0,k,l,1:]*scale).cpu().numpy()
-                label_name = labels[k]
+                dcls = labels[k]
                 l+=1
-                cls_dets = np.hstack((bndbox, np.array(k))).astype(np.float32, copy=False)
-                eval_det = np.vstack((eval_det, cls_dets))
-        est_dict[i] = eval_det
-        gt_dict[i] = gt
+                one_box = bndbox.tolist()
+                one_box.append(np.float(score))
+                one_box.append(idxOfImage)
+
+                if gcls not in det_dict:
+                    det_dict[gcls]=[]
+                det_dict[gcls].append(one_box)
         print('im_detect: {:d}/{:d} {:.3f}s'.format(i + 1, num_images, detect_time))
-    evaluate_detections(est_dict, gt_dict)
-
-def evaluate_detections(allDets, allGT):
-    iou_thresh = 0.5
-    proposals = 0.0
-    total = 0.0
-    total_face = 0.0
-    correct = 0.0
-    correct_face = 0.0
-    eps = 1e-5
-    for idx, cls_dets in allDets.items():
-        GT = allGT[idx]
-        proposals = proposals + allDets[idx].size
-        total = total + len(GT)
-        for i in range(len(GT)):
-            box_gt = GT[i][:4]
-            label_gt = GT[i][-1]
-            best_iou = 0
-            best_j = -1
-            if (label_gt == 1):
-                total_face = total_face + 1
-            for j in range(len(cls_dets)):
-                bb = cls_dets[j][:4]
-                label = cls_dets[j][4]
-                iou = bbox_iou(box_gt, bb)
-                if iou > best_iou:
-                    best_j = j
-                    best_iou = iou
-            if best_iou > iou_thresh and label == label_gt:
-                correct = correct + 1
-                if (label == 1):
-                    correct_face = correct_face + 1
-
-    precision = 1.0 * correct / (proposals + eps)
-    recall = 1.0 * correct/ (total + eps)
-    fscore = 2.0 * precision * recall / (precision + recall + eps)
-    face_mAP = correct_face / (total_face + eps)
-    mask_mAP = (correct - correct_face) / (total - total_face + eps)
-    mAP = correct / total
-    print("precision:{:.3f} recall:{:.3f} fscore:{:.3f}\
-        \nface mAP:{:.3f} mask mAP:{:.3f} mAP:{:.3f}".format(\
-            precision, recall, fscore, face_mAP, mask_mAP, mAP))
+    evaluator = Evaluator(cfg)
+    return evaluator.GetPascalVOCMetrics(classes, gt_dict, num_cls_gt, det_dict)
 
 
 img_dim = 320
@@ -183,4 +185,6 @@ if __name__ == '__main__':
     valdata = FaceRectLMDataset(args.data_dir, img_dim, rgb_mean)
 
     # evaluation
-    evaluate_net(args.save_folder, net, valdata, detect)
+    results, classes = evaluate_net(net, valdata, detect)
+    savePath = 'weights'
+    plot_save_result(cfg, results, classes, savePath)
